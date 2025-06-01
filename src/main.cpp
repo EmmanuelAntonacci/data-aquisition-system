@@ -4,7 +4,7 @@
 #include <ctime>
 #include <vector>
 #include <sstream>
-#include <iomanip>
+#include <iomanip> 
 #include <fstream>
 #include <filesystem>
 
@@ -32,19 +32,35 @@ std::string time_t_to_string(std::time_t time) {
     return ss.str();
 }
 
-
+std::vector<std::string> known_sensors;
 
 class Session : public std::enable_shared_from_this<Session>{
     public:
         explicit Session(tcp::socket socket) : session_socket(std::move(socket)) {}
 
+        ~Session(){
+            std::cout << "Sessão desligada" << std::endl;
+        }
+
         void start(){
+            std::cout << "Sessão iniciada." << std::endl;
             receive_message();
         }
 
     private:
         tcp::socket session_socket;
-        std::array<char, 1024> message_buffer;
+        boost::asio::streambuf message_buffer;
+
+        void write_message(const std::string& message)
+        {
+            auto self(shared_from_this());
+            boost::asio::async_write(session_socket, boost::asio::buffer(message),
+                [this, self, message](boost::system::error_code ec, std::size_t /*length*/){
+                    if (!ec){
+                        receive_message();
+                    }
+                });
+            }
 
         std::vector<std::string> handle_split_message(const std::string& s, char delimiter) {
             std::vector<std::string> tokens;
@@ -58,22 +74,27 @@ class Session : public std::enable_shared_from_this<Session>{
 
         void receive_message(){
             auto self(shared_from_this());
-            session_socket.async_read_some(
-            boost::asio::buffer(message_buffer),
-            [this, self](boost::system::error_code error_code, std::size_t length) {
-                if (!error_code) {
-                    std::string message(message_buffer.data(), length);
-                    handle_message(message);
-                    receive_message();
-                } else {
-                    std::cerr << "Connection error: " << error_code.message() << std::endl;
-                }
-            });
+            boost::asio::async_read_until(
+                session_socket, message_buffer, "\r\n",
+                [this, self](boost::system::error_code error_code, std::size_t length) {
+                    if (!error_code) {
+                        std::istream stream(&message_buffer);
+                        std::string message;
+                        std::getline(stream, message);
+
+                        handle_message(message);
+                        receive_message();
+                    } else if (error_code == boost::asio::error::eof) {
+                        std::cout << "Conexão encerrada pelo cliente (EOF)." << std::endl;
+                        session_socket.shutdown(tcp::socket::shutdown_both);
+                        session_socket.close();
+                    } else {
+                        std::cerr << "Erro em receive_message(): " << error_code.message() << std::endl;
+                    }
+                });
         }
 
         void handle_message(const std::string message){
-            std::cout << "Mensagem recebida: " << message << std::endl;
-            
             std::vector<std::string> split_message = handle_split_message(message, '|');
             std::string msg_type = split_message[0];
             
@@ -85,6 +106,13 @@ class Session : public std::enable_shared_from_this<Session>{
                 double value = std::stod(split_message[3]);
 
                 handle_save_log(sensor_id, timestamp, value);
+            } else if(msg_type == "GET"){
+                std::string sensor_id = split_message[1];
+                int number = std::stoi(split_message[2]);
+
+                handle_get(sensor_id, number);
+            } else{
+                std::cout << "Erro tipo de mensagem não suportada: " << message << std::endl;
             }
         }
 
@@ -97,9 +125,12 @@ class Session : public std::enable_shared_from_this<Session>{
             log.value = value;
 
             std::string sensor_id_str(sensor_id);
+            if (std::find(known_sensors.begin(), known_sensors.end(), sensor_id_str) == known_sensors.end()) {
+                known_sensors.push_back(sensor_id_str);
+            }
 
             std::ofstream sensor_file;
-            sensor_file.open("./sensor_files/"+sensor_id_str+".bin", std::ios::out | std::ios::binary);
+            sensor_file.open("./sensor_files/"+sensor_id_str+".bin", std::ios::out | std::ios::binary | std::fstream::app);
 
             if(!sensor_file.is_open()){
                 std::cerr << "Erro ao abrir file: " << sensor_id_str << std::endl;
@@ -110,9 +141,52 @@ class Session : public std::enable_shared_from_this<Session>{
             std::cout << "LogRecord created:" << std::endl;
             std::cout << "Sensor ID: " << log.sensor_id << std::endl;
             std::cout << "Timestamp: " << log.timestamp << std::endl;
-            std::cout << "Value: " << log.value << std::endl;
+            std::cout << "Value: " << log.value << std::endl << std::endl;
 
             sensor_file.close();
+        }
+
+        void handle_get(std::string sensor_id, int number){
+            if (std::find(known_sensors.begin(), known_sensors.end(), sensor_id) == known_sensors.end()) {
+                std::cout << sensor_id << " não conhecido" << std::endl;
+                std::string message = "ERROR|INVALID_SENSOR_ID\r\n";
+                write_message(message);
+            } else {
+                std::fstream file("./sensor_files/"+sensor_id+".bin", std::fstream::in | std::fstream::binary | std::fstream::app);
+
+                if(file.is_open()){
+
+                    file.seekg(0, std::ios::end);
+                    int file_size = file.tellg();
+                    file.seekg(0, std::ios::beg);
+                    int n = file_size/sizeof(LogRecord);
+
+                    if(n == 0){
+                        std::cout << "Nenhum registro encontrado no arquivo: " << "./sensor_files/"+sensor_id+".bin" << std::endl;
+                    } else{
+                        int number_reads = std::min(number, n);
+                        int start_reading = n - number_reads;
+
+                        file.seekg(start_reading * sizeof(LogRecord), std::ios::beg);
+                        std::string message = std::to_string(number_reads)+";";
+
+                        for(unsigned i=0;i<number_reads;i++){
+                            LogRecord record;
+                            file.read(reinterpret_cast<char*>(&record), sizeof(LogRecord));
+
+                            if (file.gcount() == sizeof(LogRecord)) {
+                                message += time_t_to_string(record.timestamp)+"|"+std::to_string(record.value);
+                                if (i<number_reads-2) message += ";";
+                            } else {
+                                std::cerr << "Erro ao ler o registro " << (i + 1) << " do arquivo." << std::endl;
+                                break;
+                            }
+                        } 
+                        message += "\r\n";
+                        write_message(message);
+                    }
+                }
+            }
         }
 
 };
@@ -122,6 +196,7 @@ class Server{
     public:
         Server(boost::asio::io_context& io_context, int port) : server_acceptor(io_context, tcp::endpoint(tcp::v4(), port)){
             accept_connections();
+            std::cout << "Servidor iniciado" << std::endl;
         }
 
     private:
@@ -149,7 +224,6 @@ int main(int argc, char* argv[]) {
         boost::asio::io_context io_context;
         Server server(io_context, 9000);
         io_context.run();
-
     }
     catch (const std::exception& e){
         std::cerr << "Erro em main(): " << e.what() << std::endl;
